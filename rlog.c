@@ -8,14 +8,17 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <getopt.h>
 
 #define VERSION "1.0"
 
 #define DEBUG_ENVVAR    "RLOG_DEBUG"
+#define DEFAULT_SYSLOG  "/dev/log"
 #define DEFAULT_BIND    "127.0.0.1:1040"
 #define DEFAULT_PORT    1040
 #define BACKLOG         64
@@ -373,29 +376,35 @@ static inline unsigned long earliest(unsigned long cur)
 
 struct options {
 	int do_help;
+	int do_syslog;
 	int do_debug;
 
 	char *name;
 	char *listen;
+	char *syslog;
 };
 
 static int configure(struct options *opts, int argc, char **argv)
 {
 	char *env;
 	int opt, idx;
-	const char *shorts = "hDn:l:";
+	const char *shorts = "hDsS:n:l:";
 	struct option longs[] = {
 		{ "help",         no_argument, 0, 'h' },
 		{ "debug",        no_argument, 0, 'D' },
+		{ "syslog",       no_argument, 0, 's' },
+		{ "socket", required_argument, 0, 'S' },
 		{ "name",   required_argument, 0, 'n' },
 		{ "listen", required_argument, 0, 'l' },
 		{ 0, 0, 0, 0 },
 	};
 
 	opts->do_help   = 0;
+	opts->do_syslog = 0;
 	opts->do_debug  = 0;
 	opts->name      = NULL;
 	opts->listen    = strdup(DEFAULT_BIND);
+	opts->syslog    = strdup(DEFAULT_SYSLOG);
 
 	if ((env = getenv(DEBUG_ENVVAR)) != NULL) {
 		if (*env) {
@@ -411,6 +420,15 @@ static int configure(struct options *opts, int argc, char **argv)
 
 		case 'D':
 			opts->do_debug = 1;
+			break;
+
+		case 's':
+			opts->do_syslog = 1;
+			break;
+
+		case 'S':
+			free(opts->syslog);
+			opts->syslog = strdup(optarg);
 			break;
 
 		case 'n':
@@ -434,6 +452,7 @@ static int configure(struct options *opts, int argc, char **argv)
 #define MSG(n) (ring[(n) % RING_SIZE])
 int main(int argc, char **argv)
 {
+	static char          syslog[4096];         /* for syslog reads */
 	static struct buf    input;                /* for buffered stdin reads */
 	static struct msg    ring[RING_SIZE];      /* the ring buffer */
 	static struct client clients[MAX_CLIENTS]; /* connected clients */
@@ -442,21 +461,24 @@ int main(int argc, char **argv)
 	int epfd;
 	struct epoll_event ev, events[MAX_EVENTS]; /* epoll event interface */
 
-	int listenfd, acceptfd;
+	int listenfd, acceptfd, syslogfd;
 	struct sockaddr_in *local, peer;
-	size_t len, nwrit;
-	int i, j, rc, n, nfd, eof;
-	char *env;
+	struct sockaddr_un devlog;
+	size_t len, nwrit, nread;
+	int i, j, rc, n, nfd, inputs;
+	char *p;
 
 	struct options opts;
 	rc = configure(&opts, argc, argv);
 	if (opts.do_help) {
-		fprintf(stderr, "usage: ./foo | rlog [-hD] [-n foo42] [-l 127.0.0.1:1040]\n\n");
+		fprintf(stderr, "usage: ./foo | rlog [-hDs] [-n foo42] [-l 127.0.0.1:1040]\n\n");
 		fprintf(stderr, "to connect to rlog, try nc:\n\n");
 		fprintf(stderr, "  nc 127.0.0.1 1040\n\n");
 		fprintf(stderr, "options:\n");
 		fprintf(stderr, "  -h, --help     show the help screen.\n");
 		fprintf(stderr, "  -D, --debug    enable debugging only the author could love.\n");
+		fprintf(stderr, "  -s, --syslog   consume messages sent to syslog via " DEFAULT_SYSLOG ".`\n");
+		fprintf(stderr, "  -S, --socket   bind something other than " DEFAULT_SYSLOG " for -s.\n");
 		fprintf(stderr, "  -n, --name     a string to show in the process table / netstat.\n");
 		fprintf(stderr, "  -l, --listen   what host:port to listen on\n");
 		return rc;
@@ -467,9 +489,14 @@ int main(int argc, char **argv)
 
 	verbose = opts.do_debug;
 	debug1("main(): debugging is %s\n", opts.do_debug ? "enabled" : "disabled");
+	debug1("main(): syslog input is %s\n", opts.do_syslog ? "enabled" : "disabled");
 	debug1("main(): listen address set to %s\n", opts.listen);
+	if (opts.do_syslog) {
+		debug1("main(): syslog socket set to %s\n", opts.syslog);
+	}
 	debug1("main(): process name set to %s\n", opts.name);
 
+	memset(&syslog, 0, sizeof(syslog));
 	memset(&input,  0, sizeof(input));
 	memset(ring,    0, sizeof(ring));
 	memset(clients, 0, sizeof(clients));
@@ -496,13 +523,13 @@ int main(int argc, char **argv)
 	local = parse_addr(opts.listen);
 	rc = bind(listenfd, (struct sockaddr*)local, sizeof(*local));
 	if (rc != 0) {
-		perror("bind");
+		perror("bind(net)");
 		exit(4);
 	}
 
 	rc = listen(listenfd, BACKLOG);
 	if (rc != 0) {
-		perror("listen");
+		perror("listen(net)");
 		exit(4);
 	}
 
@@ -520,6 +547,9 @@ int main(int argc, char **argv)
 		exit(4);
 	}
 
+	inputs = 0;
+
+	/* input from stdin */
 	noblocking(0);
 	ev.events = EPOLLIN;
 	ev.data.fd = 0;
@@ -528,8 +558,43 @@ int main(int argc, char **argv)
 		perror("epoll_ctl: stdin");
 		exit(4);
 	}
+	inputs++;
 
-	for (n = 2, eof = 0; n > 0;) {
+	/* input from /dev/log (syslog protocol, RFC 5424) */
+	if (opts.do_syslog) {
+		syslogfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if (syslogfd < 0) {
+			perror("socket(syslog)");
+			exit(4);
+		}
+
+		umask(0);
+		rc = fchmod(syslogfd, 0666);
+		if (rc != 0) {
+			perror("chmod(syslog, 0666)");
+			exit(4);
+		}
+
+		memset(&devlog, 0, sizeof(devlog));
+		devlog.sun_family = AF_UNIX;
+		memcpy(devlog.sun_path, opts.syslog, strlen(opts.syslog)+1);
+		rc = bind(syslogfd, (struct sockaddr*)(&devlog), sizeof(devlog));
+		if (rc != 0) {
+			perror("bind(syslog)");
+			exit(4);
+		}
+
+		ev.events = EPOLLIN;
+		ev.data.fd = syslogfd;
+		rc = epoll_ctl(epfd, EPOLL_CTL_ADD, syslogfd, &ev);
+		if (rc == -1) {
+			perror("epoll_ctl: syslog");
+			exit(4);
+		}
+		inputs++;
+	}
+
+	for (n = inputs + 1, inputs > 0; n > 0;) {
 		nfd = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		if (nfd == -1) {
 			perror("epoll_wait");
@@ -586,11 +651,11 @@ int main(int argc, char **argv)
 				continue;
 			}
 
+			/* input on stdin */
 			if (events[i].data.fd == 0) {
-				/* input on stdin */
 				rc = buf_fill(&input, events[i].data.fd);
 				if (rc == 0) {
-					fprintf(stderr, "stdin closed; sending remaining outstanding messages to connected clients and then shutting down\n");
+					debug1("main(): stdin closed: removing it from the epoll file descriptor %d\n", epfd);
 					ev.events = EPOLLIN;
 					ev.data.fd = 0;
 					rc = epoll_ctl(epfd, EPOLL_CTL_DEL, 0, &ev);
@@ -598,19 +663,23 @@ int main(int argc, char **argv)
 						perror("epoll_ctl() while de-registering stdin after EOF");
 						exit(4);
 					}
-					close(0);
-					eof = 1;
+					/* specifically, don't close(0); as that frees up the fd to be used */
+					inputs--;
 					n--;
 
-					ev.events = EPOLLIN;
-					ev.data.fd = listenfd;
-					rc = epoll_ctl(epfd, EPOLL_CTL_DEL, listenfd, &ev);
-					if (rc != 0) {
-						perror("epoll_ctl() while de-registering listenfd after EOF");
-						exit(4);
+					if (!inputs) {
+						fprintf(stderr, "stdin closed; sending remaining outstanding messages to connected clients and then shutting down\n");
+
+						ev.events = EPOLLIN;
+						ev.data.fd = listenfd;
+						rc = epoll_ctl(epfd, EPOLL_CTL_DEL, listenfd, &ev);
+						if (rc != 0) {
+							perror("epoll_ctl() while de-registering listenfd after EOF");
+							exit(4);
+						}
+						close(listenfd);
+						n--;
 					}
-					close(listenfd);
-					n--;
 				}
 				if (rc < 0) {
 					fprintf(stderr, "failed reading from stdin: %s (errno %d)\n",
@@ -625,6 +694,31 @@ int main(int argc, char **argv)
 					debug3("main(): message", ring[current % RING_SIZE].data, (int)ring[current % RING_SIZE].len);
 					current++;
 				}
+				continue;
+			}
+
+			/* input on syslog */
+			if (opts.do_syslog && events[i].data.fd == syslogfd) {
+				debug1("main(): incoming syslog message\n");
+				nread = read(syslogfd, syslog, sizeof(syslog));
+				if (nread < 0) {
+					fprintf(stderr, "failed to read from syslog socket: %s (error %d)\n", strerror(errno), errno);
+					continue; // ?
+				}
+				p = memchr(syslog, '>', nread);
+				if (!p) {
+					p = syslog;
+				} else {
+					p++;
+					nread -= (p - syslog);
+				}
+				ring[current % RING_SIZE].len = nread + 1;
+				memcpy(ring[current % RING_SIZE].data, p, nread);
+				ring[current % RING_SIZE].data[nread] = '\n';
+				debug1("main(): added new %i-byte message[%i] to ring buffer [%p]\n",
+						ring[current % RING_SIZE].len, current, ring);
+				debug3("main(): message", ring[current % RING_SIZE].data, (int)ring[current % RING_SIZE].len);
+				current++;
 				continue;
 			}
 
@@ -651,7 +745,7 @@ int main(int argc, char **argv)
 					}
 
 					if (clients[j].msgno >= current) {
-						if (eof) {
+						if (!inputs) {
 							debug1("main(): client [%p] %i exhausted the ring buffer and we have nothing more to send them; disconnecting.\n",
 								&clients[j], clients[j].fd);
 							disconnect(&clients[j], epfd);
