@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <getopt.h>
 
 #define VERSION "1.0"
 
@@ -370,6 +371,66 @@ static inline unsigned long earliest(unsigned long cur)
 	                       : cur - (RING_SIZE - 1);
 }
 
+struct options {
+	int do_help;
+	int do_debug;
+
+	char *name;
+	char *listen;
+};
+
+static int configure(struct options *opts, int argc, char **argv)
+{
+	char *env;
+	int opt, idx;
+	const char *shorts = "hDn:l:";
+	struct option longs[] = {
+		{ "help",         no_argument, 0, 'h' },
+		{ "debug",        no_argument, 0, 'D' },
+		{ "name",   required_argument, 0, 'n' },
+		{ "listen", required_argument, 0, 'l' },
+		{ 0, 0, 0, 0 },
+	};
+
+	opts->do_help   = 0;
+	opts->do_debug  = 0;
+	opts->name      = NULL;
+	opts->listen    = strdup(DEFAULT_BIND);
+
+	if ((env = getenv(DEBUG_ENVVAR)) != NULL) {
+		if (*env) {
+			opts->do_debug = 1;
+		}
+	}
+
+	while ((opt = getopt_long(argc, argv, shorts, longs, &idx)) != -1) {
+		switch (opt) {
+		case 'h':
+			opts->do_help = 1;
+			break;
+
+		case 'D':
+			opts->do_debug = 1;
+			break;
+
+		case 'n':
+			free(opts->name);
+			opts->name = strdup(optarg);
+			break;
+
+		case 'l':
+			free(opts->listen);
+			opts->listen = strdup(optarg);
+			break;
+
+		default:
+			opts->do_help = 1;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 #define MSG(n) (ring[(n) % RING_SIZE])
 int main(int argc, char **argv)
 {
@@ -387,17 +448,27 @@ int main(int argc, char **argv)
 	int i, j, rc, n, nfd, eof;
 	char *env;
 
-	if ((env = getenv(DEBUG_ENVVAR))) {
-		if (*env) {
-			verbose = 1;
-		}
-	}
-	if (argc > 2 || (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "help") == 0))) {
-		fprintf(stderr, "usage: ./foo | rlog [127.0.0.1:1040]\n\n");
+	struct options opts;
+	rc = configure(&opts, argc, argv);
+	if (opts.do_help) {
+		fprintf(stderr, "usage: ./foo | rlog [-hD] [-n foo42] [-l 127.0.0.1:1040]\n\n");
 		fprintf(stderr, "to connect to rlog, try nc:\n\n");
 		fprintf(stderr, "  nc 127.0.0.1 1040\n\n");
-		return 0;
+		fprintf(stderr, "options:\n");
+		fprintf(stderr, "  -h, --help     show the help screen.\n");
+		fprintf(stderr, "  -D, --debug    enable debugging only the author could love.\n");
+		fprintf(stderr, "  -n, --name     a string to show in the process table / netstat.\n");
+		fprintf(stderr, "  -l, --listen   what host:port to listen on\n");
+		return rc;
 	}
+	if (rc != 0) {
+		return rc;
+	}
+
+	verbose = opts.do_debug;
+	debug1("main(): debugging is %s\n", opts.do_debug ? "enabled" : "disabled");
+	debug1("main(): listen address set to %s\n", opts.listen);
+	debug1("main(): process name set to %s\n", opts.name);
 
 	memset(&input,  0, sizeof(input));
 	memset(ring,    0, sizeof(ring));
@@ -422,7 +493,7 @@ int main(int argc, char **argv)
 		exit(4);
 	}
 
-	local = parse_addr(argc == 2 ? argv[1] : DEFAULT_BIND);
+	local = parse_addr(opts.listen);
 	rc = bind(listenfd, (struct sockaddr*)local, sizeof(*local));
 	if (rc != 0) {
 		perror("bind");
