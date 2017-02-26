@@ -562,6 +562,8 @@ int main(int argc, char **argv)
 				if (clients[j].fd != events[i].data.fd) continue;
 
 				if (events[i].events & EPOLLHUP) {
+					debug1("main(): epollhup event received for client [%p] %i; disconnecting...\n",
+							&clients[j], clients[j].fd);
 					disconnect(&clients[j], epfd);
 				}
 
@@ -579,6 +581,8 @@ int main(int argc, char **argv)
 
 					if (clients[j].msgno >= current) {
 						if (eof) {
+							debug1("main(): client [%p] %i exhausted the ring buffer and we have nothing more to send them; disconnecting.\n",
+								&clients[j], clients[j].fd);
 							disconnect(&clients[j], epfd);
 							n--;
 						}
