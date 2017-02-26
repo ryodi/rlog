@@ -494,7 +494,20 @@ int main(int argc, char **argv)
 	if (opts.do_syslog) {
 		debug1("main(): syslog socket set to %s\n", opts.syslog);
 	}
-	debug1("main(): process name set to %s\n", opts.name);
+	if (opts.name != NULL) {
+		debug1("main(): process name set to %s\n", opts.name);
+
+		nwrit = 0;
+		for (i = 0; i < argc; i++) {
+			nwrit += strlen(argv[i])+1;
+		}
+		memset(argv[0], 0, nwrit);
+		strncpy(argv[0], "rlog: ", strlen("rlog: "));
+		strncpy(argv[0]+strlen("rlog: "), opts.name, strlen(opts.name));
+		/* FIXME: figure out how to setproctitle, then blogs about it */
+	} else {
+		debug1("main(): process name not set\n");
+	}
 
 	memset(&syslog, 0, sizeof(syslog));
 	memset(&input,  0, sizeof(input));
